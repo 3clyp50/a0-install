@@ -62,7 +62,12 @@ trap 'restore_tty; exit 130' INT
 trap 'restore_tty; exit 143' TERM HUP
 
 DOCKER=(docker)
+DOCKER_HOST_ARGS=()
 DOCKER_SUDO_NOTICE_SHOWN=0
+
+A0_COLIMA_PROFILE="${A0_COLIMA_PROFILE:-a0}"
+A0_MAC_RUNTIME_DIR="${A0_MAC_RUNTIME_DIR:-$HOME/Library/Application Support/a0-install/runtime}"
+A0_MAC_BIN_DIR="$A0_MAC_RUNTIME_DIR/bin"
 
 # Read a single byte from /dev/tty with a short (~0.1s) timeout.
 # Used to disambiguate bare Escape from arrow-key escape sequences.
@@ -430,23 +435,24 @@ probe_docker_info() {
 }
 
 configure_docker_access() {
-    if probe_docker_info docker; then
-        DOCKER=(docker)
+    if probe_docker_info docker "${DOCKER_HOST_ARGS[@]}"; then
+        DOCKER=(docker "${DOCKER_HOST_ARGS[@]}")
         return 0
+    fi
+
+    if [ "$(id -u 2>/dev/null)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+        if probe_docker_info sudo docker "${DOCKER_HOST_ARGS[@]}"; then
+            DOCKER=(sudo docker "${DOCKER_HOST_ARGS[@]}")
+            if [ "$DOCKER_SUDO_NOTICE_SHOWN" -eq 0 ]; then
+                print_warn "Using sudo for Docker commands in this run. Log out and back in later to use Docker without sudo."
+                DOCKER_SUDO_NOTICE_SHOWN=1
+            fi
+            return 0
+        fi
     fi
 
     case "$DOCKER_INFO_STATUS" in
         permission)
-            if [ "$(id -u 2>/dev/null)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
-                if probe_docker_info sudo docker; then
-                    DOCKER=(sudo docker)
-                    if [ "$DOCKER_SUDO_NOTICE_SHOWN" -eq 0 ]; then
-                        print_warn "Using sudo for Docker commands in this run. Log out and back in later to use Docker without sudo."
-                        DOCKER_SUDO_NOTICE_SHOWN=1
-                    fi
-                    return 0
-                fi
-            fi
             return 2
             ;;
         daemon|missing)
@@ -467,14 +473,12 @@ start_docker_daemon() {
 
     case "$OS_NAME" in
         Darwin)
-            print_info "Starting Docker Desktop..."
-            if command -v open >/dev/null 2>&1; then
-                open -a Docker
+            print_info "Starting Docker runtime..."
+            if command -v open >/dev/null 2>&1 && open -a Docker >/dev/null 2>&1; then
                 return 0
-            else
-                print_error "Cannot start Docker Desktop automatically."
-                return 1
             fi
+            print_info "Docker Desktop was not found. Setting up Colima runtime..."
+            ensure_macos_colima_runtime
             ;;
         Linux)
             print_info "Starting Docker daemon..."
@@ -501,7 +505,7 @@ start_docker_daemon() {
 }
 
 wait_for_docker_daemon() {
-    MAX_WAIT=30
+    MAX_WAIT=90
     WAITED=0
 
     print_info "Waiting for Docker daemon to be ready..."
@@ -543,7 +547,16 @@ run_root_script() {
 }
 
 safe_install_user() {
-    INSTALL_USER="${SUDO_USER:-${USER:-}}"
+    INSTALL_USER=""
+    if [ "$(id -u 2>/dev/null)" -eq 0 ]; then
+        INSTALL_USER="${SUDO_USER:-}"
+    fi
+    if [ -z "$INSTALL_USER" ] && command -v id >/dev/null 2>&1; then
+        INSTALL_USER="$(id -un 2>/dev/null || true)"
+    fi
+    if [ -z "$INSTALL_USER" ]; then
+        INSTALL_USER="${USER:-}"
+    fi
     case "$INSTALL_USER" in
         ""|*[!A-Za-z0-9_.-]*)
             return 1
@@ -601,10 +614,12 @@ install_docker_on_linux() {
     run_root_script "$INSTALL_SCRIPT"
 
     print_info "Starting Docker daemon..."
-    if command -v systemctl >/dev/null 2>&1; then
-        run_as_root systemctl enable --now docker
-    elif command -v service >/dev/null 2>&1; then
-        run_as_root service docker start
+    if command -v systemctl >/dev/null 2>&1 && run_as_root systemctl enable --now docker >/dev/null 2>&1; then
+        :
+    elif command -v service >/dev/null 2>&1 && run_as_root service docker start >/dev/null 2>&1; then
+        :
+    else
+        print_warn "Docker Engine was installed, but the daemon did not start automatically."
     fi
 
     INSTALL_USER="$(safe_install_user || true)"
@@ -613,6 +628,316 @@ install_docker_on_linux() {
         run_root_script "if getent group docker >/dev/null 2>&1; then usermod -aG docker '${INSTALL_USER}'; fi"
         print_warn "Your next login session will use Docker without sudo."
     fi
+}
+
+macos_runtime_arch() {
+    case "$(uname -m 2>/dev/null || true)" in
+        arm64) printf "arm64\n" ;;
+        x86_64) printf "x86_64\n" ;;
+        *)
+            print_error "Unsupported macOS architecture: $(uname -m 2>/dev/null || true)"
+            return 1
+            ;;
+    esac
+}
+
+macos_docker_static_arch() {
+    case "$(uname -m 2>/dev/null || true)" in
+        arm64) printf "aarch64\n" ;;
+        x86_64) printf "x86_64\n" ;;
+        *)
+            print_error "Unsupported macOS architecture: $(uname -m 2>/dev/null || true)"
+            return 1
+            ;;
+    esac
+}
+
+require_macos_runtime_tools() {
+    local _missing=""
+    local _tool
+    for _tool in curl tar shasum python3; do
+        if ! command -v "$_tool" >/dev/null 2>&1; then
+            _missing="${_missing:+${_missing} }${_tool}"
+        fi
+    done
+
+    if [ -n "$_missing" ]; then
+        print_error "macOS runtime setup needs these tools: ${_missing}"
+        print_info "Install Apple's Command Line Tools with: xcode-select --install"
+        return 1
+    fi
+}
+
+set_colima_docker_host() {
+    local _socket="$HOME/.colima/${A0_COLIMA_PROFILE}/docker.sock"
+    DOCKER_HOST_ARGS=(-H "unix://${_socket}")
+    DOCKER=(docker "${DOCKER_HOST_ARGS[@]}")
+}
+
+github_latest_asset() {
+    local _api_url="$1"
+    local _pattern="$2"
+
+    python3 - "$_api_url" "$_pattern" <<'PY'
+import json
+import re
+import sys
+import urllib.request
+
+api_url = sys.argv[1]
+pattern = re.compile(sys.argv[2])
+request = urllib.request.Request(
+    api_url,
+    headers={"Accept": "application/vnd.github+json", "User-Agent": "A0-Install"},
+)
+with urllib.request.urlopen(request, timeout=45) as response:
+    payload = json.load(response)
+for asset in payload.get("assets", []):
+    name = asset.get("name") or ""
+    url = asset.get("browser_download_url") or ""
+    if pattern.match(name) and url:
+        print(f"{name}|{url}")
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+docker_static_cli_asset() {
+    local _arch="$1"
+    local _index_url="https://download.docker.com/mac/static/stable/${_arch}/"
+
+    python3 - "$_index_url" <<'PY'
+import re
+import sys
+import urllib.request
+
+index_url = sys.argv[1]
+request = urllib.request.Request(index_url, headers={"User-Agent": "A0-Install"})
+with urllib.request.urlopen(request, timeout=45) as response:
+    html = response.read().decode("utf-8", "replace")
+
+assets = []
+for name, version in re.findall(r'href="(docker-([0-9]+(?:\.[0-9]+){2}(?:-[0-9]+)?)\.tgz)"', html):
+    key = tuple(int(part) for part in re.split(r"[.-]", version))
+    assets.append((key, name))
+
+if not assets:
+    raise SystemExit(1)
+
+name = sorted(assets)[-1][1]
+print(f"{name}|{index_url}{name}")
+PY
+}
+
+checksum_from_url() {
+    local _url="$1"
+    local _asset_name="$2"
+
+    curl -fsSL "$_url" | awk -v wanted="$_asset_name" '
+        NF == 1 {
+            print $1
+            found = 1
+            exit
+        }
+        NF >= 2 {
+            file = $NF
+            sub(/^\*/, "", file)
+            n = split(file, parts, "/")
+            if (parts[n] == wanted) {
+                print $1
+                found = 1
+                exit
+            }
+        }
+        END { if (!found) exit 1 }
+    '
+}
+
+download_verified() {
+    local _url="$1"
+    local _dest="$2"
+    local _expected_sha="${3:-}"
+    local _tmp="${_dest}.tmp.$$"
+    local _actual_sha
+
+    mkdir -p "$(dirname "$_dest")"
+    rm -f "$_tmp"
+    if ! curl -fsSL --retry 3 --connect-timeout 20 --output "$_tmp" "$_url"; then
+        rm -f "$_tmp"
+        return 1
+    fi
+
+    if [ -n "$_expected_sha" ]; then
+        _actual_sha="$(shasum -a 256 "$_tmp" | awk '{print $1}')"
+        if [ "$_actual_sha" != "$_expected_sha" ]; then
+            rm -f "$_tmp"
+            print_error "Checksum verification failed for $(basename "$_dest")."
+            return 1
+        fi
+    fi
+
+    mv "$_tmp" "$_dest"
+}
+
+install_macos_docker_client() {
+    if command -v docker >/dev/null 2>&1; then
+        print_ok "Docker client already installed"
+        return 0
+    fi
+
+    local _docker_arch
+    _docker_arch="$(macos_docker_static_arch)" || return 1
+
+    local _asset _asset_name _asset_url _tar_path _extract_dir
+    _asset="$(docker_static_cli_asset "$_docker_arch")" || {
+        print_error "Could not find Docker's macOS static client."
+        return 1
+    }
+    _asset_name="${_asset%%|*}"
+    _asset_url="${_asset#*|}"
+    _tar_path="$A0_MAC_RUNTIME_DIR/${_asset_name}"
+    _extract_dir="$(mktemp -d "${TMPDIR:-/tmp}/a0-docker-cli.XXXXXX")"
+
+    print_info "Downloading Docker client..."
+    # Docker's macOS static index does not publish checksum sidecars.
+    if ! download_verified "$_asset_url" "$_tar_path" ""; then
+        rm -rf "$_extract_dir"
+        print_error "Could not download Docker client."
+        return 1
+    fi
+
+    print_info "Installing Docker client..."
+    if ! tar -xzf "$_tar_path" -C "$_extract_dir" docker/docker; then
+        rm -rf "$_extract_dir" "$_tar_path"
+        print_error "Could not extract Docker client."
+        return 1
+    fi
+    cp "$_extract_dir/docker/docker" "$A0_MAC_BIN_DIR/docker"
+    chmod 755 "$A0_MAC_BIN_DIR/docker"
+    rm -rf "$_extract_dir" "$_tar_path"
+}
+
+install_macos_colima_tools() {
+    if command -v colima >/dev/null 2>&1 && command -v limactl >/dev/null 2>&1; then
+        print_ok "Colima runtime tools already installed"
+        return 0
+    fi
+
+    local _arch
+    _arch="$(macos_runtime_arch)" || return 1
+
+    local _colima_release_api="https://api.github.com/repos/abiosoft/colima/releases/latest"
+    local _lima_release_api="https://api.github.com/repos/lima-vm/lima/releases/latest"
+    local _colima_asset _colima_sha_asset _lima_asset _lima_guest_asset _lima_sha_asset
+    _colima_asset="$(github_latest_asset "$_colima_release_api" "^colima-Darwin-${_arch}$")" || {
+        print_error "Could not find a Colima release for macOS ${_arch}."
+        return 1
+    }
+    _colima_sha_asset="$(github_latest_asset "$_colima_release_api" "^colima-Darwin-${_arch}[.]sha256sum$")" || {
+        print_error "Could not find Colima checksum metadata."
+        return 1
+    }
+    _lima_asset="$(github_latest_asset "$_lima_release_api" "^lima-[0-9].*-Darwin-${_arch}[.]tar[.]gz$")" || {
+        print_error "Could not find a Lima release for macOS ${_arch}."
+        return 1
+    }
+    _lima_guest_asset="$(github_latest_asset "$_lima_release_api" "^lima-additional-guestagents-.*-Darwin-${_arch}[.]tar[.]gz$")" || {
+        print_error "Could not find Lima guest agent metadata."
+        return 1
+    }
+    _lima_sha_asset="$(github_latest_asset "$_lima_release_api" "^SHA256SUMS$")" || {
+        print_error "Could not find Lima checksum metadata."
+        return 1
+    }
+
+    local _colima_name="${_colima_asset%%|*}" _colima_url="${_colima_asset#*|}"
+    local _colima_sha_url="${_colima_sha_asset#*|}"
+    local _lima_name="${_lima_asset%%|*}" _lima_url="${_lima_asset#*|}"
+    local _lima_guest_name="${_lima_guest_asset%%|*}" _lima_guest_url="${_lima_guest_asset#*|}"
+    local _lima_sha_url="${_lima_sha_asset#*|}"
+
+    local _colima_sha _lima_sha _lima_guest_sha
+    _colima_sha="$(checksum_from_url "$_colima_sha_url" "$_colima_name")" || {
+        print_error "Could not verify Colima checksum metadata."
+        return 1
+    }
+    _lima_sha="$(checksum_from_url "$_lima_sha_url" "$_lima_name")" || {
+        print_error "Could not verify Lima checksum metadata."
+        return 1
+    }
+    _lima_guest_sha="$(checksum_from_url "$_lima_sha_url" "$_lima_guest_name")" || {
+        print_error "Could not verify Lima guest agent checksum metadata."
+        return 1
+    }
+
+    local _colima_path="$A0_MAC_BIN_DIR/colima"
+    local _lima_tar="$A0_MAC_RUNTIME_DIR/${_lima_name}"
+    local _lima_guest_tar="$A0_MAC_RUNTIME_DIR/${_lima_guest_name}"
+
+    print_info "Downloading Colima and Lima..."
+    download_verified "$_colima_url" "$_colima_path" "$_colima_sha" || return 1
+    chmod 755 "$_colima_path"
+    download_verified "$_lima_url" "$_lima_tar" "$_lima_sha" || return 1
+    download_verified "$_lima_guest_url" "$_lima_guest_tar" "$_lima_guest_sha" || return 1
+
+    print_info "Installing Colima and Lima..."
+    tar -xzf "$_lima_tar" -C "$A0_MAC_RUNTIME_DIR" || return 1
+    tar -xzf "$_lima_guest_tar" -C "$A0_MAC_RUNTIME_DIR" || return 1
+    rm -f "$_lima_tar" "$_lima_guest_tar"
+}
+
+wait_for_colima_docker() {
+    local _max_wait=90
+    local _waited=0
+
+    print_info "Waiting for Colima Docker runtime..."
+    while [ "$_waited" -lt "$_max_wait" ]; do
+        if probe_docker_info docker "${DOCKER_HOST_ARGS[@]}"; then
+            DOCKER=(docker "${DOCKER_HOST_ARGS[@]}")
+            print_ok "Docker daemon is ready"
+            return 0
+        fi
+        sleep 1
+        _waited=$((_waited + 1))
+        printf "."
+    done
+    printf "\n"
+    print_error "Colima Docker runtime did not become ready within ${_max_wait} seconds."
+    return 1
+}
+
+ensure_macos_colima_runtime() {
+    require_macos_runtime_tools || return 1
+    mkdir -p "$A0_MAC_BIN_DIR"
+    case ":$PATH:" in
+        *":$A0_MAC_BIN_DIR:"*) ;;
+        *) export PATH="$A0_MAC_BIN_DIR:$PATH" ;;
+    esac
+
+    install_macos_docker_client || return 1
+    install_macos_colima_tools || return 1
+    set_colima_docker_host
+
+    if probe_docker_info docker "${DOCKER_HOST_ARGS[@]}"; then
+        DOCKER=(docker "${DOCKER_HOST_ARGS[@]}")
+        print_ok "Docker daemon is running"
+        return 0
+    fi
+
+    local _previous_context=""
+    _previous_context="$(docker context show 2>/dev/null || true)"
+
+    print_info "Starting Colima profile '${A0_COLIMA_PROFILE}'..."
+    if ! colima start "$A0_COLIMA_PROFILE" --runtime docker; then
+        print_error "Could not start Colima runtime."
+        return 1
+    fi
+
+    if [ -n "$_previous_context" ] && [ "$_previous_context" != "colima-${A0_COLIMA_PROFILE}" ]; then
+        docker context use "$_previous_context" >/dev/null 2>&1 || true
+    fi
+
+    wait_for_colima_docker
 }
 
 check_docker() {
@@ -629,8 +954,8 @@ check_docker() {
                 install_docker_on_linux || exit 1
                 ;;
             Darwin)
-                print_error "Docker is not installed. Install Docker Desktop, start it, then rerun this installer."
-                exit 1
+                print_warn "Docker not found. Setting up Colima runtime..."
+                ensure_macos_colima_runtime || exit 1
                 ;;
             *)
                 print_error "Docker is not installed. Install Docker Engine or Docker Desktop, then rerun this installer."

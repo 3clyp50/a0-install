@@ -45,12 +45,13 @@ pwsh -File .\install.ps1
 
 ## Prerequisites
 
-- **Docker Engine / Docker Desktop** with a running daemon
+- **Docker Engine / Docker Desktop** with a running daemon, or the macOS/Linux tools needed for the installer to set one up.
 
 Notes:
 
-- On **macOS**, the script can open Docker Desktop for you, but you still need it installed.
+- On **macOS**, the script can open Docker Desktop when it is installed. If Docker is missing, it can set up a Colima runtime with a dedicated `a0` profile and installer-owned Colima, Lima, and Docker CLI binaries. Homebrew is not required.
 - On **Linux**, `install.sh` can install Docker Engine through the detected package manager. Debian/Ubuntu use `apt-get install docker.io`.
+- On Linux families where the script detects `yast`, raw `rpm`, or no supported package manager, it will not guess a Docker installation path. Install Docker packages manually, then rerun the installer.
 - On **Windows**, `install.ps1` will not install Docker automatically; it will direct you to install Docker Desktop.
 
 ## What the installer does
@@ -76,16 +77,15 @@ When you create a new instance, the installer will prompt you for:
 
 Then it:
 
-- Writes a per-instance `docker-compose.yml`
 - Pulls the image
-- Starts the container via `docker compose up -d`
+- Starts the container directly with Docker
 - Waits for the UI to respond (tries `http://localhost:<port>`)
 
 ### Where files are stored
 
 The installer creates a per-instance directory:
 
-- `~/agent-zero/<instance>/docker-compose.yml`
+- `~/agent-zero/<instance>/usr`
 
 And mounts your data directory into the container:
 
