@@ -45,6 +45,56 @@ function Wait-ForKeypress {
     Write-Host ''
 }
 
+function Test-InteractiveConsole {
+    try {
+        $null = [Console]::KeyAvailable
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Test-WindowsServer {
+    try {
+        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+        return ($os.ProductType -ne 1 -or $os.Caption -match 'Windows Server')
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-OptionalFeatureState {
+    param([string]$Name)
+
+    try {
+        $feature = Get-WindowsOptionalFeature -Online -FeatureName $Name -ErrorAction Stop
+        return "$($feature.State)"
+    }
+    catch {
+        return 'unknown'
+    }
+}
+
+function Show-WindowsServerDockerGuidance {
+    print_error 'Docker is not available on this Windows Server host.'
+    print_warn 'Docker Desktop is not supported on Windows Server. Agent Zero requires a Linux-container Docker runtime.'
+
+    $wslFeature = Get-OptionalFeatureState 'Microsoft-Windows-Subsystem-Linux'
+    $vmPlatform = Get-OptionalFeatureState 'VirtualMachinePlatform'
+
+    if ($wslFeature -ne 'Enabled' -or $vmPlatform -ne 'Enabled') {
+        print_info 'A WSL2-backed Docker Engine can be used when WSL2 and nested virtualization are available.'
+        print_info 'Enable WSL2 with: wsl.exe --install --no-distribution'
+        print_info 'Restart Windows, then install a Linux distro and Docker Engine inside WSL.'
+    }
+    else {
+        print_info 'WSL2 features are enabled. If WSL2 still cannot start, this VM likely needs nested virtualization or Hyper-V support from the host provider.'
+        print_info 'After a WSL2 Docker Engine is running, expose it through a Docker CLI or a local Docker endpoint, then rerun this installer.'
+    }
+}
+
 # Check whether a TCP port is in use on localhost.
 # Checks Docker container port mappings and system listeners.
 # Returns $true if in use, $false if free.
@@ -294,6 +344,15 @@ function wait_for_docker_daemon {
 
 function check_docker {
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+        if (Test-WindowsServer) {
+            Show-WindowsServerDockerGuidance
+            exit 1
+        }
+        if (-not (Test-InteractiveConsole)) {
+            print_error 'Docker is not installed. Install Docker Desktop, then rerun this installer from an interactive PowerShell session.'
+            exit 1
+        }
+
         # Docker not found — show interactive menu instead of auto-opening browser
         while ($true) {
             $idx = select_from_menu -Header 'Docker is not installed. Please install Docker Desktop to continue.' `
@@ -327,6 +386,16 @@ function check_docker {
 
     if (-not (check_docker_daemon_running)) {
         print_warn "Docker daemon is not running"
+        if (Test-WindowsServer) {
+            print_error 'Docker is installed, but its daemon is not reachable.'
+            print_info 'Start your Windows Server Docker endpoint or WSL2-backed Docker Engine, then rerun this installer.'
+            exit 1
+        }
+        if (-not (Test-InteractiveConsole)) {
+            print_error 'Docker daemon is not running. Start Docker Desktop, then rerun this installer from an interactive PowerShell session.'
+            exit 1
+        }
+
         # Try to auto-start Docker Desktop first
         $autoStarted = start_docker_daemon
         if ($autoStarted) {
@@ -369,7 +438,7 @@ function Get-NonEmptyLines {
 function Wait-ForReady {
     param([string]$Url)
 
-    $maxWait = 60
+    $maxWait = 300
     $waited = 0
 
     Write-Host "[INFO] Launching Agent Zero..." -ForegroundColor Green -NoNewline
@@ -507,14 +576,45 @@ function fetch_available_tags {
     return $parsedTags.ToArray()
 }
 
+function fetch_latest_release_tag {
+    $releasesUrl = 'https://api.github.com/repos/agent0ai/agent-zero/releases?per_page=100'
+
+    try {
+        $payload = Invoke-RestMethod -Uri $releasesUrl -Method Get
+    }
+    catch {
+        return ''
+    }
+
+    foreach ($item in @($payload)) {
+        $tag = "$($item.tag_name)"
+        if ($item.draft -or $item.prerelease) {
+            continue
+        }
+        if ($tag -match '^v[0-9]+\.[0-9]+(\.[0-9]+)?$') {
+            return $tag
+        }
+    }
+
+    return ''
+}
+
+function default_image_tag {
+    $tag = fetch_latest_release_tag
+    if (-not [string]::IsNullOrWhiteSpace($tag)) {
+        return $tag
+    }
+    return 'latest'
+}
+
 function select_image_tag {
-    $script:SelectedTag = 'latest'
+    $script:SelectedTag = default_image_tag
 
     $allTags = @(fetch_available_tags)
 
     if ($allTags.Count -eq 0) {
         Write-Host 'Select version:'
-        print_warn 'No additional tags found. Using latest.'
+        print_warn "No additional tags found. Using $script:SelectedTag."
         print_info "Selected version: $script:SelectedTag"
         Write-Host ''
         return $true
@@ -549,10 +649,14 @@ function select_image_tag {
 
     if ($menuTags.Count -eq 0) {
         Write-Host 'Select version:'
-        print_warn 'No tags found. Using latest.'
+        print_warn "No tags found. Using $script:SelectedTag."
         print_info "Selected version: $script:SelectedTag"
         Write-Host ''
         return $true
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($script:SelectedTag) -and -not $menuTags.Contains($script:SelectedTag)) {
+        $menuTags.Insert(0, $script:SelectedTag)
     }
 
     $selectedIndex = select_from_menu -Header 'Select version:' -Options $menuTags.ToArray()
@@ -630,7 +734,7 @@ function create_instance {
                 if ($modeIndex -eq 0) {
                     # Quick Start: use all defaults, skip to auth
                     $quickStart = $true
-                    $script:SelectedTag = 'latest'
+                    $script:SelectedTag = default_image_tag
                     $containerName = $defaultName
                     $instanceDir = Join-Path $installRoot $containerName
                     $dataDir = Join-Path $instanceDir 'usr'
@@ -726,7 +830,7 @@ function create_instance {
                 Write-Host ''
                 if ($quickStart) {
                     print_info 'Quick Start selected. Using defaults:'
-                    print_ok "Version:   latest"
+                    print_ok "Version:   $script:SelectedTag"
                     print_ok "Instance:  $containerName"
                     print_ok "Port:      $port"
                     print_ok "Data dir:  $dataDir"

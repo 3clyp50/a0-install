@@ -52,7 +52,7 @@ Notes:
 - On **macOS**, the script can open Docker Desktop when it is installed. If Docker is missing, it can set up a Colima runtime with a dedicated `a0` profile and installer-owned Colima, Lima, and Docker CLI binaries. Homebrew is not required.
 - On **Linux**, `install.sh` can install Docker Engine through the detected package manager. Debian/Ubuntu use `apt-get install docker.io`.
 - On Linux families where the script detects `yast`, raw `rpm`, or no supported package manager, it will not guess a Docker installation path. Install Docker packages manually, then rerun the installer.
-- On **Windows**, `install.ps1` will not install Docker automatically; it will direct you to install Docker Desktop.
+- On **Windows**, `install.ps1` will not install Docker automatically. On client Windows, it directs you to Docker Desktop. On Windows Server, where Docker Desktop is not supported, it reports the need for an existing Docker endpoint or a WSL2-backed Linux Docker Engine with nested virtualization.
 
 ## What the installer does
 
@@ -69,7 +69,7 @@ Both `install.sh` and `install.ps1` implement the same flow:
 
 When you create a new instance, the installer will prompt you for:
 
-- **Version tag** (`install.sh` Quick Start prefers the newest stable GitHub Release tag, including current `vX.Y` releases; manual mode also shows Docker Hub tags)
+- **Version tag** (Quick Start prefers the newest stable GitHub Release tag, including current `vX.Y` releases; manual mode also shows Docker Hub tags)
 - **Instance/container name** (default: `agent-zero`, or `agent-zero-2`, ...)
 - **Data directory** (default: `~/agent-zero/<instance>/usr`)
 - **Web UI port** (default: first free port starting at `5080`)
