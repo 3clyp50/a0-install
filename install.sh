@@ -1155,7 +1155,7 @@ for item in payload.get("results", []):
     printf "%s\n" "$PARSED_TAGS"
 }
 
-fetch_latest_semver_release_tag() {
+fetch_latest_release_tag() {
     RELEASES_URL="https://api.github.com/repos/agent0ai/agent-zero/releases?per_page=100"
     RAW_RELEASES_JSON="$(curl -fsSL "$RELEASES_URL" 2>/dev/null || true)"
 
@@ -1173,7 +1173,7 @@ for item in payload:
     tag=item.get("tag_name") or ""
     if item.get("draft") or item.get("prerelease"):
         continue
-    if re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag):
+    if re.fullmatch(r"v[0-9]+\.[0-9]+(\.[0-9]+)?", tag):
         print(tag)
         sys.exit(0)
 sys.exit(1)
@@ -1181,12 +1181,13 @@ sys.exit(1)
     fi
 
     printf "%s\n" "$RAW_RELEASES_JSON" \
-        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' \
+        | tr ',' '\n' \
+        | sed -n 's/^[[:space:]]*"tag_name"[[:space:]]*:[[:space:]]*"\(v[0-9][0-9]*\.[0-9][0-9]*\(\.[0-9][0-9]*\)\{0,1\}\)".*/\1/p' \
         | head -n 1
 }
 
 default_image_tag() {
-    DEFAULT_IMAGE_TAG="$(fetch_latest_semver_release_tag || true)"
+    DEFAULT_IMAGE_TAG="$(fetch_latest_release_tag || true)"
     if [ -n "$DEFAULT_IMAGE_TAG" ]; then
         printf "%s\n" "$DEFAULT_IMAGE_TAG"
     else
