@@ -95,6 +95,23 @@ function Show-WindowsServerDockerGuidance {
     }
 }
 
+function Show-WindowsClientDockerGuidance {
+    param(
+        [switch]$DaemonOnly
+    )
+
+    if ($DaemonOnly) {
+        print_error 'Docker CLI is installed, but the Docker daemon is not reachable.'
+        print_info 'Start Docker Desktop, or set DOCKER_HOST to a reachable Docker-compatible endpoint, then rerun this installer.'
+    }
+    else {
+        print_error 'Docker is not installed or is not on PATH.'
+        print_info 'Install Docker Desktop, or install Docker CLI and configure it for a Docker-compatible endpoint, then rerun this installer.'
+    }
+
+    print_info 'For a WSL Docker Engine endpoint, expose Docker on loopback only, for example tcp://127.0.0.1:23750.'
+}
+
 # Check whether a TCP port is in use on localhost.
 # Checks Docker container port mappings and system listeners.
 # Returns $true if in use, $false if free.
@@ -225,11 +242,22 @@ function select_from_menu {
         exit 1
     }
 
+    if (-not (Test-InteractiveConsole)) {
+        print_error 'This installer menu requires an interactive PowerShell session.'
+        exit 1
+    }
+
     $selectedIndex = 0
 
     # Flush any buffered keypresses so stale input doesn't auto-select an option
-    while ([Console]::KeyAvailable) {
-        [void][Console]::ReadKey($true)
+    try {
+        while ([Console]::KeyAvailable) {
+            [void][Console]::ReadKey($true)
+        }
+    }
+    catch {
+        print_error 'This installer menu requires an interactive PowerShell session.'
+        exit 1
     }
 
     while ($true) {
@@ -349,7 +377,7 @@ function check_docker {
             exit 1
         }
         if (-not (Test-InteractiveConsole)) {
-            print_error 'Docker is not installed. Install Docker Desktop, then rerun this installer from an interactive PowerShell session.'
+            Show-WindowsClientDockerGuidance
             exit 1
         }
 
@@ -392,7 +420,7 @@ function check_docker {
             exit 1
         }
         if (-not (Test-InteractiveConsole)) {
-            print_error 'Docker daemon is not running. Start Docker Desktop, then rerun this installer from an interactive PowerShell session.'
+            Show-WindowsClientDockerGuidance -DaemonOnly
             exit 1
         }
 
@@ -586,17 +614,64 @@ function fetch_latest_release_tag {
         return ''
     }
 
+    $candidates = New-Object System.Collections.Generic.List[object]
     foreach ($item in @($payload)) {
         $tag = "$($item.tag_name)"
         if ($item.draft -or $item.prerelease) {
             continue
         }
-        if ($tag -match '^v[0-9]+\.[0-9]+(\.[0-9]+)?$') {
-            return $tag
+
+        $version = Convert-AgentZeroReleaseTagToVersion -Tag $tag
+        if ($null -ne $version) {
+            $publishedAt = [datetime]::MinValue
+            if (-not [string]::IsNullOrWhiteSpace("$($item.published_at)")) {
+                try {
+                    $publishedAt = [datetime]::Parse("$($item.published_at)")
+                }
+                catch {
+                    $publishedAt = [datetime]::MinValue
+                }
+            }
+            $candidates.Add([pscustomobject]@{
+                Tag = $tag
+                Version = $version
+                PublishedAt = $publishedAt
+            })
         }
     }
 
+    if ($candidates.Count -gt 0) {
+        $selected = $candidates |
+            Sort-Object -Property @{ Expression = { $_.Version }; Descending = $true }, @{ Expression = { $_.PublishedAt }; Descending = $true } |
+            Select-Object -First 1
+        return $selected.Tag
+    }
+
     return ''
+}
+
+function Convert-AgentZeroReleaseTagToVersion {
+    param([string]$Tag)
+
+    $tagValue = ''
+    if ($null -ne $Tag) {
+        $tagValue = $Tag.Trim()
+    }
+    if ($tagValue -notmatch '^v(?<major>[0-9]+)\.(?<minor>[0-9]+)(\.(?<patch>[0-9]+))?$') {
+        return $null
+    }
+
+    $patch = '0'
+    if ($Matches.ContainsKey('patch') -and -not [string]::IsNullOrWhiteSpace($Matches['patch'])) {
+        $patch = $Matches['patch']
+    }
+
+    try {
+        return [version]"$($Matches['major']).$($Matches['minor']).$patch"
+    }
+    catch {
+        return $null
+    }
 }
 
 function default_image_tag {
