@@ -203,7 +203,7 @@ function Get-InstallerResumeLaunchCommand {
 function Register-InstallerRuntimeSetupResume {
     $command = Get-InstallerResumeLaunchCommand
     if ([string]::IsNullOrWhiteSpace($command)) {
-        return
+        return $false
     }
 
     try {
@@ -213,9 +213,11 @@ function Register-InstallerRuntimeSetupResume {
             /d $command `
             /f *> $null
         print_info 'Agent Zero installer will resume once after your next Windows sign-in.'
+        return $true
     }
     catch {
         print_warn "Could not register automatic post-restart resume: $(Get-CleanCommandText $_)"
+        return $false
     }
 }
 
@@ -385,7 +387,7 @@ function Invoke-ElevatedPowerShellScript {
 function Install-WslFeatures {
     print_info 'Agent Zero will set up the local Windows runtime.'
     print_info 'Windows may ask for approval. A restart may be required before setup can continue.'
-    Register-InstallerRuntimeSetupResume
+    $resumeRegistered = Register-InstallerRuntimeSetupResume
 
     $featureScript = @'
 $ErrorActionPreference = "Stop"
@@ -406,7 +408,12 @@ exit $LASTEXITCODE
     }
 
     print_warn 'Windows runtime setup was started.'
-    print_warn 'Restart Windows if prompted. The installer will resume once after your next sign-in.'
+    if ($resumeRegistered) {
+        print_warn 'Restart Windows if prompted. The installer will resume once after your next sign-in.'
+    }
+    else {
+        print_warn 'Restart Windows if prompted, then rerun this installer to continue Agent Zero setup.'
+    }
     return 'followup'
 }
 
