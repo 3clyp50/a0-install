@@ -421,7 +421,7 @@ probe_docker_info() {
         *"permission denied"*|*"Permission denied"*|*"Got permission denied"*)
             DOCKER_INFO_STATUS="permission"
             ;;
-        *"Cannot connect to the Docker daemon"*|*"Is the docker daemon running"*|*"connection refused"*|*"Connection refused"*)
+        *"Cannot connect to the Docker daemon"*|*"Is the docker daemon running"*|*"failed to connect to the docker API"*|*"connection refused"*|*"Connection refused"*|*"connect: no such file or directory"*)
             DOCKER_INFO_STATUS="daemon"
             ;;
         *"command not found"*|*"No such file or directory"*)
@@ -440,7 +440,8 @@ configure_docker_access() {
         return 0
     fi
 
-    if [ "$(id -u 2>/dev/null)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+    local _plain_docker_status="$DOCKER_INFO_STATUS"
+    if [ "$_plain_docker_status" = "permission" ] && [ "$(id -u 2>/dev/null)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
         if probe_docker_info sudo docker "${DOCKER_HOST_ARGS[@]}"; then
             DOCKER=(sudo docker "${DOCKER_HOST_ARGS[@]}")
             if [ "$DOCKER_SUDO_NOTICE_SHOWN" -eq 0 ]; then
@@ -451,7 +452,7 @@ configure_docker_access() {
         fi
     fi
 
-    case "$DOCKER_INFO_STATUS" in
+    case "$_plain_docker_status" in
         permission)
             return 2
             ;;
@@ -477,7 +478,7 @@ start_docker_daemon() {
             if command -v open >/dev/null 2>&1 && open -a Docker >/dev/null 2>&1; then
                 return 0
             fi
-            print_info "Docker Desktop was not found. Setting up Colima runtime..."
+            print_info "Docker Desktop was not found or could not be opened. Setting up Colima runtime..."
             ensure_macos_colima_runtime
             ;;
         Linux)
@@ -510,8 +511,8 @@ wait_for_docker_daemon() {
 
     print_info "Waiting for Docker daemon to be ready..."
     while [ $WAITED -lt $MAX_WAIT ]; do
-        configure_docker_access
-        _docker_ready_rc=$?
+        _docker_ready_rc=0
+        configure_docker_access || _docker_ready_rc=$?
         if [ "$_docker_ready_rc" -eq 0 ]; then
             print_ok "Docker daemon is ready"
             return 0
@@ -967,8 +968,8 @@ check_docker() {
     # -----------------------------------------------------------
     # 2. Ensure Docker daemon is running
     # -----------------------------------------------------------
-    check_docker_daemon_running
-    DOCKER_READY_RC=$?
+    DOCKER_READY_RC=0
+    check_docker_daemon_running || DOCKER_READY_RC=$?
     if [ "$DOCKER_READY_RC" -eq 2 ]; then
         print_error "Docker is installed, but your user cannot access it yet."
         print_warn "Log out and back in once so your docker group membership is applied, then rerun this installer."
