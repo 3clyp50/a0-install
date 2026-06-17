@@ -16,6 +16,12 @@
     "linuxDockerPackage": "docker.io",
     "macosColimaProfile": "a0",
     "windowsDefaultWslDistro": "Ubuntu",
-    "windowsWslDockerMode": "direct-wsl-cli"
+    "windowsWslDockerMode": "direct-wsl-cli",
+    "endpointSelectionPolicy": "reuse-before-setup",
+    "endpointSources": [
+      "DOCKER_HOST",
+      "docker contexts",
+      "known local endpoints"
+    ]
   }
 }

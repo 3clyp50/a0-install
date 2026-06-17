@@ -42,6 +42,7 @@ root = Path.cwd()
 contract = json.loads((root / "runtime-contract.json").read_text(encoding="utf-8"))
 bash_script = (root / "install.sh").read_text(encoding="utf-8")
 ps_script = (root / "install.ps1").read_text(encoding="utf-8")
+readme = (root / "README.md").read_text(encoding="utf-8")
 
 checks = [
     ("backend.imageRepository", contract["backend"]["imageRepository"], bash_script, ps_script),
@@ -55,6 +56,12 @@ checks = [
     ("runtime.macosColimaProfile", contract["runtime"]["macosColimaProfile"], bash_script, None),
     ("runtime.windowsDefaultWslDistro", contract["runtime"]["windowsDefaultWslDistro"], None, ps_script),
     ("runtime.windowsWslDockerMode", "wsl.exe @wslArgs", None, ps_script),
+    ("runtime.endpointSelectionPolicy", contract["runtime"]["endpointSelectionPolicy"], bash_script, ps_script, readme),
+    ("runtime.endpointSources.DOCKER_HOST", "DOCKER_HOST", bash_script, ps_script, readme),
+    ("runtime.endpointSources.contexts", "docker context", bash_script, ps_script, readme),
+    ("runtime.endpointSources.knownLocal.bash", "try_known_docker_socket_candidates", bash_script, None, None),
+    ("runtime.endpointSources.knownLocal.ps", "Use-KnownDockerEndpointCandidates", None, ps_script, None),
+    ("runtime.endpointSources.knownLocal.docs", "known local", None, None, readme),
 ]
 
 missing = []
@@ -63,7 +70,7 @@ for label, needle, *haystacks in checks:
         if haystack is None:
             continue
         if needle not in haystack:
-            target = "install.sh" if index == 0 else "install.ps1"
+            target = ("install.sh", "install.ps1", "README.md")[index]
             missing.append(f"{label}: {needle!r} not found in {target}")
 
 for needle, target, text in [

@@ -29,7 +29,11 @@ $ErrorActionPreference = 'Stop'
 
 $script:HomeDir = [Environment]::GetFolderPath('UserProfile')
 $script:SelectedTag = 'latest'
+$script:RuntimeEndpointSelectionPolicy = 'reuse-before-setup'
 $script:DockerMode = 'windows'
+$script:DockerHostArgs = @()
+$script:DockerEndpointNoticeShown = $false
+$script:DockerEndpointScanSeen = @{}
 $script:WslDockerDistro = ''
 $script:WslKeepAliveNoticeShown = $false
 $script:DefaultWslDistro = 'Ubuntu'
@@ -806,6 +810,7 @@ function Test-WslDockerAvailable {
             & wsl.exe -d $distro --exec sh -lc 'docker info >/dev/null 2>&1'
             if ($LASTEXITCODE -eq 0) {
                 $script:DockerMode = 'wsl'
+                $script:DockerHostArgs = @()
                 $script:WslDockerDistro = $distro
                 return $true
             }
@@ -827,6 +832,7 @@ function Use-WslDockerRuntimeIfInstalled {
 
         if (Start-WslDockerEngine -Distro $distro) {
             $script:DockerMode = 'wsl'
+            $script:DockerHostArgs = @()
             $script:WslDockerDistro = $distro
             print_ok "Using Docker Engine inside WSL distro '$script:WslDockerDistro'"
             return $true
@@ -885,6 +891,7 @@ function Ensure-WindowsClientWslRuntime {
     }
 
     $script:DockerMode = 'wsl'
+    $script:DockerHostArgs = @()
     $script:WslDockerDistro = $distro
     print_ok "Using Docker Engine inside WSL distro '$script:WslDockerDistro'"
     return 'ready'
@@ -916,7 +923,169 @@ function Invoke-Docker {
         return
     }
 
-    & docker @Arguments
+    $dockerArgs = @()
+    $dockerArgs += $script:DockerHostArgs
+    $dockerArgs += $Arguments
+    & docker @dockerArgs
+}
+
+function Normalize-DockerHostCandidate {
+    param([string]$HostValue)
+
+    if ([string]::IsNullOrWhiteSpace($HostValue)) {
+        return ''
+    }
+
+    $trimmed = $HostValue.Trim()
+    if ($trimmed -match '^(unix|npipe|tcp|http|https|ssh)://') {
+        return $trimmed
+    }
+
+    return ''
+}
+
+function Test-LocalDockerHostCandidate {
+    param([string]$HostValue)
+
+    if ([string]::IsNullOrWhiteSpace($HostValue)) {
+        return $false
+    }
+
+    return (
+        $HostValue -match '^npipe://' -or
+        $HostValue -match '^unix://' -or
+        $HostValue -match '^(tcp|http|https)://localhost[:/]' -or
+        $HostValue -match '^(tcp|http|https)://127\.' -or
+        $HostValue -match '^(tcp|http|https)://\[::1\][:/]'
+    )
+}
+
+function Use-DockerEndpointIfReachable {
+    param(
+        [string]$Label,
+        [string]$HostValue
+    )
+
+    $hostCandidate = Normalize-DockerHostCandidate -HostValue $HostValue
+    if ([string]::IsNullOrWhiteSpace($hostCandidate)) {
+        return $false
+    }
+    if (-not (Test-LocalDockerHostCandidate -HostValue $hostCandidate)) {
+        return $false
+    }
+    if ($script:DockerEndpointScanSeen.ContainsKey($hostCandidate)) {
+        return $false
+    }
+    $script:DockerEndpointScanSeen[$hostCandidate] = $true
+
+    try {
+        & docker --host $hostCandidate info *> $null 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            $script:DockerMode = 'windows'
+            $script:DockerHostArgs = @('--host', $hostCandidate)
+            $script:WslDockerDistro = ''
+            if (-not $script:DockerEndpointNoticeShown) {
+                print_ok "Using Docker runtime: $Label"
+                $script:DockerEndpointNoticeShown = $true
+            }
+            return $true
+        }
+    }
+    catch { }
+
+    return $false
+}
+
+function Use-DockerHostEnvEndpoint {
+    if ([string]::IsNullOrWhiteSpace($env:DOCKER_HOST)) {
+        return $false
+    }
+
+    return (Use-DockerEndpointIfReachable -Label 'DOCKER_HOST' -HostValue $env:DOCKER_HOST)
+}
+
+function Use-DockerContextEndpoint {
+    param([string]$ContextName)
+
+    if ([string]::IsNullOrWhiteSpace($ContextName)) {
+        return $false
+    }
+
+    try {
+        $hostValue = (& docker context inspect $ContextName --format '{{ (index .Endpoints "docker").Host }}' 2>$null | Select-Object -First 1)
+        if ([string]::IsNullOrWhiteSpace($hostValue) -or "$hostValue" -eq '<no value>') {
+            return $false
+        }
+        return (Use-DockerEndpointIfReachable -Label "Docker context '$ContextName'" -HostValue "$hostValue")
+    }
+    catch {
+        return $false
+    }
+}
+
+function Use-DockerContextEndpoints {
+    $currentContext = ''
+    try {
+        $currentContext = "$(& docker context show 2>$null)".Trim()
+    }
+    catch { }
+
+    if ((-not [string]::IsNullOrWhiteSpace($currentContext)) -and (Use-DockerContextEndpoint -ContextName $currentContext)) {
+        return $true
+    }
+
+    $contexts = @()
+    try {
+        $contexts = @(& docker context ls --format '{{.Name}}' 2>$null | ForEach-Object { "$($_)".Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    }
+    catch { }
+
+    foreach ($context in $contexts) {
+        if ($context -eq $currentContext) {
+            continue
+        }
+        if (Use-DockerContextEndpoint -ContextName $context) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Use-KnownDockerEndpointCandidates {
+    $candidates = @(
+        @{ Label = 'Docker Engine'; Host = 'npipe:////./pipe/docker_engine' },
+        @{ Label = 'Docker Desktop'; Host = 'npipe:////./pipe/dockerDesktopLinuxEngine' },
+        @{ Label = 'Podman'; Host = 'npipe:////./pipe/podman-machine-default' }
+    )
+
+    foreach ($candidate in $candidates) {
+        if (Use-DockerEndpointIfReachable -Label $candidate.Label -HostValue $candidate.Host) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Use-ExistingDockerEndpoint {
+    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+        return $false
+    }
+
+    $script:DockerEndpointScanSeen = @{}
+
+    if (Use-DockerHostEnvEndpoint) {
+        return $true
+    }
+    if (Use-DockerContextEndpoints) {
+        return $true
+    }
+    if (Use-KnownDockerEndpointCandidates) {
+        return $true
+    }
+
+    return $false
 }
 
 # Check whether a TCP port is in use on localhost.
@@ -1262,6 +1431,9 @@ function check_docker {
     }
 
     if (-not (check_docker_daemon_running)) {
+        if (Use-ExistingDockerEndpoint) {
+            return
+        }
         if (Test-WslDockerAvailable) {
             print_ok "Using Docker Engine inside WSL distro '$script:WslDockerDistro'"
             return
@@ -1313,6 +1485,9 @@ function check_docker {
                 }
             }
 
+            if (Use-ExistingDockerEndpoint) {
+                return
+            }
             if (Test-WslDockerAvailable) {
                 print_ok "Using Docker Engine inside WSL distro '$script:WslDockerDistro'"
                 return

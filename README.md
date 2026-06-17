@@ -80,6 +80,8 @@ Useful flags:
 
 Notes:
 
+- Before setting up a runtime, the installer follows the `reuse-before-setup` policy: it first reuses reachable Docker-compatible endpoints from the current Docker CLI configuration, `DOCKER_HOST`, docker context entries, and known local sockets or pipes. It never changes the global Docker context, shell environment, or socket symlinks.
+- Known local endpoint probes cover Docker Engine/Desktop, rootless Docker, Colima, OrbStack, Rancher Desktop, and Podman when they expose a Docker-compatible API. Manager layers such as Portainer are not treated as runtimes.
 - On **macOS**, the script can open Docker Desktop when it is installed. If Docker is missing, it can set up a Colima runtime with a dedicated `a0` profile and installer-owned Colima, Lima, and Docker CLI binaries. Homebrew is not required.
 - On **Linux**, `install.sh` can install Docker Engine through the detected package manager. Debian/Ubuntu use `apt-get install docker.io`.
 - On Linux families where the script detects `yast`, raw `rpm`, or no supported package manager, it will not guess a Docker installation path. Install Docker packages manually, then rerun the installer.

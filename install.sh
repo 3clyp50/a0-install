@@ -48,6 +48,7 @@ A0_CLI_AUTH_LOGIN=""
 A0_CLI_AUTH_PASSWORD=""
 A0_CLI_AUTH_LOGIN_SET=0
 A0_CLI_AUTH_PASSWORD_SET=0
+A0_RUNTIME_ENDPOINT_SELECTION_POLICY="reuse-before-setup"
 
 usage() {
     cat <<'EOF'
@@ -198,6 +199,8 @@ trap 'restore_tty; exit 143' TERM HUP
 DOCKER=(docker)
 DOCKER_HOST_ARGS=()
 DOCKER_SUDO_NOTICE_SHOWN=0
+A0_DOCKER_ENDPOINT_NOTICE_SHOWN=0
+A0_DOCKER_ENDPOINT_SCAN_SEEN=""
 
 A0_COLIMA_PROFILE="${A0_COLIMA_PROFILE:-a0}"
 A0_MAC_RUNTIME_DIR="${A0_MAC_RUNTIME_DIR:-$HOME/Library/Application Support/a0-install/runtime}"
@@ -591,6 +594,172 @@ probe_docker_info() {
     return 1
 }
 
+normalize_docker_host_candidate() {
+    local _host="$1"
+    case "$_host" in
+        "")
+            return 1
+            ;;
+        unix://*|tcp://*|http://*|https://*|ssh://*)
+            printf "%s\n" "$_host"
+            ;;
+        /*)
+            printf "unix://%s\n" "$_host"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+is_local_docker_host_candidate() {
+    case "$1" in
+        unix://*|tcp://localhost:*|tcp://127.*|tcp://[[]::1[]]:*|http://localhost:*|https://localhost:*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+docker_host_socket_exists() {
+    local _host="$1"
+    local _socket
+    case "$_host" in
+        unix://*)
+            _socket="${_host#unix://}"
+            [ -e "$_socket" ]
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
+try_docker_endpoint_candidate() {
+    local _label="$1"
+    local _candidate="$2"
+    local _host
+
+    _host="$(normalize_docker_host_candidate "$_candidate")" || return 1
+    is_local_docker_host_candidate "$_host" || return 1
+    docker_host_socket_exists "$_host" || return 1
+
+    case "$A0_DOCKER_ENDPOINT_SCAN_SEEN" in
+        *"|${_host}|"*)
+            return 1
+            ;;
+    esac
+    A0_DOCKER_ENDPOINT_SCAN_SEEN="${A0_DOCKER_ENDPOINT_SCAN_SEEN}|${_host}|"
+
+    if probe_docker_info docker -H "$_host"; then
+        DOCKER_HOST_ARGS=(-H "$_host")
+        DOCKER=(docker "${DOCKER_HOST_ARGS[@]}")
+        if [ "$A0_DOCKER_ENDPOINT_NOTICE_SHOWN" -eq 0 ]; then
+            print_ok "Using Docker runtime: ${_label}"
+            A0_DOCKER_ENDPOINT_NOTICE_SHOWN=1
+        fi
+        return 0
+    fi
+
+    return 1
+}
+
+try_docker_host_env_endpoint() {
+    if [ -z "${DOCKER_HOST:-}" ]; then
+        return 1
+    fi
+    try_docker_endpoint_candidate "DOCKER_HOST" "$DOCKER_HOST"
+}
+
+try_docker_context_endpoint() {
+    local _context="$1"
+    local _host
+
+    if [ -z "$_context" ]; then
+        return 1
+    fi
+
+    _host="$(docker context inspect "$_context" --format '{{ (index .Endpoints "docker").Host }}' 2>/dev/null || true)"
+    if [ -z "$_host" ] || [ "$_host" = "<no value>" ]; then
+        return 1
+    fi
+
+    try_docker_endpoint_candidate "Docker context '${_context}'" "$_host"
+}
+
+try_docker_context_endpoints() {
+    local _current_context
+    local _contexts
+    local _context
+
+    if ! command -v docker >/dev/null 2>&1; then
+        return 1
+    fi
+
+    _current_context="$(docker context show 2>/dev/null || true)"
+    if [ -n "$_current_context" ] && try_docker_context_endpoint "$_current_context"; then
+        return 0
+    fi
+
+    _contexts="$(docker context ls --format '{{.Name}}' 2>/dev/null || true)"
+    while IFS= read -r _context; do
+        [ -n "$_context" ] || continue
+        [ "$_context" != "$_current_context" ] || continue
+        if try_docker_context_endpoint "$_context"; then
+            return 0
+        fi
+    done <<EOF
+$_contexts
+EOF
+
+    return 1
+}
+
+try_known_docker_socket_candidate() {
+    local _label="$1"
+    local _socket="$2"
+    [ -n "$_socket" ] || return 1
+    [ -e "$_socket" ] || return 1
+    try_docker_endpoint_candidate "$_label" "unix://${_socket}"
+}
+
+try_known_docker_socket_candidates() {
+    local _uid=""
+    _uid="$(id -u 2>/dev/null || true)"
+
+    try_known_docker_socket_candidate "Docker Engine" "/var/run/docker.sock" && return 0
+    try_known_docker_socket_candidate "Docker Desktop" "$HOME/.docker/run/docker.sock" && return 0
+    try_known_docker_socket_candidate "Docker Desktop" "$HOME/.docker/desktop/docker.sock" && return 0
+    try_known_docker_socket_candidate "OrbStack" "$HOME/.orbstack/run/docker.sock" && return 0
+    try_known_docker_socket_candidate "Rancher Desktop" "$HOME/.rd/docker.sock" && return 0
+    try_known_docker_socket_candidate "Colima ${A0_COLIMA_PROFILE}" "$HOME/.colima/${A0_COLIMA_PROFILE}/docker.sock" && return 0
+    if [ "$A0_COLIMA_PROFILE" != "default" ]; then
+        try_known_docker_socket_candidate "Colima default" "$HOME/.colima/default/docker.sock" && return 0
+    fi
+
+    if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+        try_known_docker_socket_candidate "Rootless Docker" "$XDG_RUNTIME_DIR/docker.sock" && return 0
+        try_known_docker_socket_candidate "Podman" "$XDG_RUNTIME_DIR/podman/podman.sock" && return 0
+    fi
+    if [ -n "$_uid" ]; then
+        try_known_docker_socket_candidate "Rootless Docker" "/run/user/${_uid}/docker.sock" && return 0
+        try_known_docker_socket_candidate "Podman" "/run/user/${_uid}/podman/podman.sock" && return 0
+    fi
+    try_known_docker_socket_candidate "Podman" "$HOME/.local/share/containers/podman/machine/podman.sock" && return 0
+
+    return 1
+}
+
+try_existing_docker_runtime_endpoints() {
+    A0_DOCKER_ENDPOINT_SCAN_SEEN=""
+
+    try_docker_host_env_endpoint && return 0
+    try_docker_context_endpoints && return 0
+    try_known_docker_socket_candidates && return 0
+
+    return 1
+}
+
 configure_docker_access() {
     if probe_docker_info docker "${DOCKER_HOST_ARGS[@]}"; then
         DOCKER=(docker "${DOCKER_HOST_ARGS[@]}")
@@ -598,6 +767,10 @@ configure_docker_access() {
     fi
 
     local _plain_docker_status="$DOCKER_INFO_STATUS"
+    if [ "${#DOCKER_HOST_ARGS[@]}" -eq 0 ] && try_existing_docker_runtime_endpoints; then
+        return 0
+    fi
+
     if [ "$_plain_docker_status" = "permission" ] && [ "$(id -u 2>/dev/null)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
         if probe_docker_info sudo docker "${DOCKER_HOST_ARGS[@]}"; then
             DOCKER=(sudo docker "${DOCKER_HOST_ARGS[@]}")
@@ -1120,8 +1293,18 @@ check_docker() {
                     print_error "Docker is not installed or not on PATH, and runtime setup was skipped."
                     exit 1
                 fi
-                print_warn "Docker not found. Setting up Colima runtime..."
-                ensure_macos_colima_runtime || exit 1
+                print_warn "Docker CLI not found. Installing the Agent Zero Docker client..."
+                require_macos_runtime_tools || exit 1
+                mkdir -p "$A0_MAC_BIN_DIR"
+                case ":$PATH:" in
+                    *":$A0_MAC_BIN_DIR:"*) ;;
+                    *) export PATH="$A0_MAC_BIN_DIR:$PATH" ;;
+                esac
+                install_macos_docker_client || exit 1
+                if ! try_existing_docker_runtime_endpoints; then
+                    print_warn "No existing Docker-compatible runtime was reachable. Setting up Colima runtime..."
+                    ensure_macos_colima_runtime || exit 1
+                fi
                 ;;
             *)
                 print_error "Docker is not installed. Install Docker Engine or Docker Desktop, then rerun this installer."
